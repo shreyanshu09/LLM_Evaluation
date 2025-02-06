@@ -6,14 +6,25 @@ import logging
 from pathlib import Path
 import time
 import tiktoken
+import re
+from typing import Tuple, Dict
+import torch
+import gc
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # List of models to test
 MODELS = [
+    "llama3.2:3b-instruct-fp16",
+    "llama3.1:8b-instruct-fp16",
+    "deepseek-r1:14b-qwen-distill-q4_K_M",
+    "deepseek-r1:14b-qwen-distill-fp16",
+    "qwen2.5:1.5b-instruct-fp16",
     "qwen2.5:3b-instruct-fp16",
-    "qwen2.5:7b-instruct-fp16"
+    "qwen2.5:7b-instruct-fp16",
+    "qwen2.5:14b-instruct-q4_0",
+    "qwen2.5:14b-instruct-fp16"
 ]
 
 def count_tokens(text: str) -> int:
@@ -47,7 +58,7 @@ def simple_translation(text: str, model_name: str, target_lang: str) -> Tuple[st
     }
     
     try:
-        prompt = f'''Translate the given text strictly in {target_lang} language only.\n\nTEXT:{text}'''
+        prompt = f'''Translate the given text formally and strictly in {target_lang} language only.\n\nTEXT:{text}'''
         token_counts["prompt_tokens"] = count_tokens(prompt)
         
         response = ollama.chat(
@@ -57,6 +68,10 @@ def simple_translation(text: str, model_name: str, target_lang: str) -> Tuple[st
         )
         
         translation = response['message']['content']
+        
+        # Remove <think>...</think>\n\n if present
+        translation = re.sub(r'^<think>.*?</think>\s*\n\n', '', translation, flags=re.DOTALL)
+        
         token_counts["output_tokens"] = count_tokens(translation)
         token_counts["total_tokens"] = token_counts["prompt_tokens"] + token_counts["output_tokens"]
         
@@ -133,7 +148,7 @@ def main():
         "timing_file": "timing_statistics.json",
         "token_file": "token_statistics.json",
         "performance_file": "performance_metrics.json",
-        "openai_api_key": "SECRET"  # Replace with your API key
+        "openai_api_key": "SECRET"  # Replace with your API key 
     }
     
     # Ensure input file exists
@@ -145,60 +160,81 @@ def main():
         with open(config["input_file"], "r", encoding="utf-8") as f:
             texts = [line.strip() for line in f.readlines() if line.strip()]
         
-        all_results = []
+        # Prepare a list to store per-text results.
+        # Each entry will store the original text, translations and associated timings/tokens.
+        all_results = [{
+            "original": text,
+            "translations": {},  # {model: translation}
+            "translation_times": {},  # {model: translation_time}
+            "translation_tokens": {}  # {model: token_counts}
+        } for text in texts]
+        
+        # Global stats
         overall_scores = {model: 0 for model in MODELS}
         timing_stats = {
             "translation_times": {model: [] for model in MODELS},
             "evaluation_times": [],
-            "per_text_times": []
+            "per_text_times": []  # total time per text (sum of its translations and evaluation)
         }
         token_stats = {
             "translation_tokens": {model: [] for model in MODELS},
             "evaluation_tokens": []
         }
         
-        for i, text in enumerate(texts, 1):
-            text_start_time = time.time()
-            logging.info(f"Processing text {i}/{len(texts)}")
-            
-            translations = {}
-            translation_times = {}
-            translation_tokens = {}
-            
-            for model in MODELS:
+        # ----- Translation Phase: Process one model at a time -----
+        for model in MODELS:
+            if torch.cuda.is_available():
+                print("START CLEAR")
+                gc.collect() 
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                print("CLEAR")
+
+            logging.info(f"Loading and processing translations for model: {model}")
+            # (If there is an explicit model load function, call it here.)
+            for idx, text in enumerate(texts):
                 translation, trans_time, trans_tokens = simple_translation(text, model, config["target_lang"])
-                if translation:  # Only store if translation was successful
-                    translations[model] = translation
-                    translation_times[model] = trans_time
-                    translation_tokens[model] = trans_tokens
-                    timing_stats["translation_times"][model].append(trans_time)
-                    token_stats["translation_tokens"][model].append(trans_tokens)
-            
-            if translations:  # Only evaluate if we have translations
+                # Save the translation if successful
+                if translation:
+                    all_results[idx]["translations"][model] = translation
+                all_results[idx]["translation_times"][model] = trans_time
+                all_results[idx]["translation_tokens"][model] = trans_tokens
+                
+                timing_stats["translation_times"][model].append(trans_time)
+                token_stats["translation_tokens"][model].append(trans_tokens)
+        
+        # ----- Evaluation Phase: Process evaluation per text -----
+        for idx, result in enumerate(all_results):
+            text = result["original"]
+            translations = result["translations"]
+            # Only evaluate if there is at least one successful translation.
+            if translations:
+                eval_start = time.time()
                 scores, eval_time, eval_tokens = evaluate_translation(text, translations, config["openai_api_key"])
+                result["scores"] = scores
+                result["evaluation_time"] = eval_time
+                result["evaluation_tokens"] = eval_tokens
                 timing_stats["evaluation_times"].append(eval_time)
                 token_stats["evaluation_tokens"].append(eval_tokens)
+                # Sum the translation times for this text from all models plus evaluation time
+                total_text_time = sum(result["translation_times"].values()) + eval_time
+                result["total_time"] = total_text_time
+                timing_stats["per_text_times"].append(total_text_time)
                 
+                # Update overall scores
                 for model, score in scores.items():
                     overall_scores[model] += score
-                
-                text_total_time = time.time() - text_start_time
-                timing_stats["per_text_times"].append(text_total_time)
-                
-                all_results.append({
-                    "original": text,
-                    "translations": translations,
-                    "scores": scores,
-                    "translation_times": translation_times,
-                    "translation_tokens": translation_tokens,
-                    "evaluation_time": eval_time,
-                    "evaluation_tokens": eval_tokens,
-                    "total_time": text_total_time
-                })
+            else:
+                # If no translations succeeded, still record a zero evaluation
+                result["scores"] = {model: 0 for model in MODELS}
+                result["evaluation_time"] = 0
+                result["evaluation_tokens"] = {"input_tokens": 0, "prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                result["total_time"] = sum(result["translation_times"].values())
+                timing_stats["per_text_times"].append(result["total_time"])
         
         # Calculate averages and summaries
         num_texts = len(texts)
-        avg_scores = {model: score/num_texts for model, score in overall_scores.items()}
+        avg_scores = {model: overall_scores[model] / num_texts for model in overall_scores}
         
         # Timing summary
         timing_summary = {
